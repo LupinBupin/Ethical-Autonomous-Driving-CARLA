@@ -14,8 +14,11 @@ class EncodeState():
 
             for params in self.conv_encoder.parameters():
                 params.requires_grad = False
-        except:
+        except Exception as e:
+            import traceback
             print('Encoder could not be initialized.')
+            traceback.print_exc()
+            print('Actual error:', e)
             sys.exit()
     
     def process(self, observation):

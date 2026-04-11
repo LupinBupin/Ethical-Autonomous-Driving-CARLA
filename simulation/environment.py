@@ -2,6 +2,7 @@ import time
 import random
 import numpy as np
 import pygame
+import traceback
 from simulation.connection import carla
 from simulation.sensors import CameraSensor, CameraSensorEnv, CollisionSensor
 from simulation.settings import *
@@ -9,7 +10,7 @@ from simulation.settings import *
 
 class CarlaEnvironment():
 
-    def __init__(self, client, world, town, checkpoint_frequency=100, continuous_action=True) -> None:
+    def __init__(self, client, world, town, checkpoint_frequency=100, continuous_action=True, scenario="Scenario01") -> None:
 
 
         self.client = client
@@ -27,6 +28,9 @@ class CarlaEnvironment():
         self.checkpoint_frequency = checkpoint_frequency
         self.route_waypoints = None
         self.town = town
+        self.scenario = scenario
+        self.sensor_objects = []
+        self.episode_count = 0
         
         # Objects to be kept alive
         self.camera_obj = None
@@ -38,20 +42,42 @@ class CarlaEnvironment():
         self.sensor_list = list()
         self.actor_list = list()
         self.walker_list = list()
-        self.create_pedestrians()
+
+        # Create CSV file with header (only once)
+        with open("training_results.csv", "w") as f:
+            f.write("episode,timesteps,reward,distance,collision,pedestrian_collision\n")
 
 
 
     # A reset function for reseting our environment.
     def reset(self):
-
         try:
-            
-            if len(self.actor_list) != 0 or len(self.sensor_list) != 0:
-                self.client.apply_batch([carla.command.DestroyActor(x) for x in self.sensor_list])
-                self.client.apply_batch([carla.command.DestroyActor(x) for x in self.actor_list])
-                self.sensor_list.clear()
-                self.actor_list.clear()
+            self.pedestrian = None
+            self.pedestrian_crossing = False
+            self.ped_start = None
+            self.ped_end = None
+
+            # Destroy sensors first
+            self.client.apply_batch([
+                carla.command.DestroyActor(x) for x in self.sensor_list if x is not None
+            ])
+            self.sensor_list.clear()
+
+            # Destroy vehicles / actors
+            self.client.apply_batch([
+                carla.command.DestroyActor(x) for x in self.actor_list if x is not None
+            ])
+            self.actor_list.clear()
+
+            # Destroy walkers (IMPORTANT)
+            self.client.apply_batch([
+                carla.command.DestroyActor(x) for x in self.walker_list if x is not None
+            ])
+            self.walker_list.clear()
+
+            self.sensor_objects.clear()
+
+            # Now remove Python references
             self.remove_sensors()
 
 
@@ -68,9 +94,79 @@ class CarlaEnvironment():
                 transform = random.choice(self.map.get_spawn_points())
                 self.total_distance = 250
 
-            self.vehicle = self.world.try_spawn_actor(vehicle_bp, transform)
-            self.actor_list.append(self.vehicle)
+            if self.scenario == "Scenario01":
+                spawn_location = carla.Location(x=55.97, y=62.03, z=0.5)
 
+                waypoint = self.map.get_waypoint(
+                    spawn_location,
+                    project_to_road=True,
+                    lane_type=carla.LaneType.Driving
+                )
+
+                ego_transform = waypoint.transform
+                ego_transform.location.z += 0.5
+
+                self.vehicle = self.world.try_spawn_actor(vehicle_bp, ego_transform)
+
+                self.pedestrian_delay = 2.0  # seconds
+                self.episode_start_time = time.time()
+
+                # Ensure walker list exists
+                if not hasattr(self, "walker_list"):
+                    self.walker_list = []
+
+                walker_bp = random.choice(self.world.get_blueprint_library().filter("walker.pedestrian.*"))
+
+                waypoint = self.map.get_waypoint(self.vehicle.get_location(), project_to_road=True)
+
+                waypoint = self.map.get_waypoint(self.vehicle.get_location(), project_to_road=True)
+
+                next_wps = waypoint.next(10.0)
+                if len(next_wps) == 0:
+                    print("No waypoint ahead")
+                    return
+
+                ped_waypoint = next_wps[0]
+                ped_loc = ped_waypoint.transform.location
+
+                # Spawn on left sidewalk/edge
+                ped_transform = carla.Transform(
+                    carla.Location(
+                        x=ped_loc.x,
+                        y=ped_loc.y + 4.5,  # 4.5m to the left of the lane center
+                        z=1.0
+                    ),
+                    carla.Rotation(yaw=ped_waypoint.transform.rotation.yaw)
+                )
+
+                walker = None
+                for _ in range(5):
+                    walker = self.world.try_spawn_actor(walker_bp, ped_transform)
+                    if walker is not None:
+                        break
+
+                if walker is not None:
+                    self.walker_list.append(walker)
+
+                    self.pedestrian = walker
+                    self.pedestrian_crossing = True
+
+                    start = carla.Location(x=ped_loc.x, y=ped_loc.y + 3.5, z=1.0)
+                    end = carla.Location(x=ped_loc.x, y=ped_loc.y - 3.5, z=1.0)
+
+                    self.ped_start = start
+                    self.ped_end = end
+                else:
+                    print("Failed to spawn pedestrian for Scenario01")
+                    self.pedestrian_crossing = False
+                    self.pedestrian = None
+            else:
+                self.vehicle = self.world.try_spawn_actor(vehicle_bp, transform)
+                ## Add more scenarios here by defining the transform for the ego vehicle and then spawning it in the env
+
+            if self.vehicle is None:
+                raise Exception("Failed to spawn the main vehicle. Please check the spawn points and try again.")
+            self.actor_list.append(self.vehicle)
 
             # Camera Sensor
             self.camera_obj = CameraSensor(self.vehicle)
@@ -78,16 +174,20 @@ class CarlaEnvironment():
                 time.sleep(0.0001)
             self.image_obs = self.camera_obj.front_camera.pop(-1)
             self.sensor_list.append(self.camera_obj.sensor)
+            self.sensor_objects.append(self.camera_obj)
 
             # Third person view of our vehicle in the Simulated env
             if self.display_on:
                 self.env_camera_obj = CameraSensorEnv(self.vehicle)
                 self.sensor_list.append(self.env_camera_obj.sensor)
+                self.sensor_objects.append(self.env_camera_obj)
 
             # Collision sensor
             self.collision_obj = CollisionSensor(self.vehicle)
             self.collision_history = self.collision_obj.collision_data
+            print("collision_history length:", len(self.collision_history))
             self.sensor_list.append(self.collision_obj.sensor)
+            self.sensor_objects.append(self.collision_obj)
 
             
             self.timesteps = 0
@@ -143,15 +243,17 @@ class CarlaEnvironment():
             time.sleep(0.5)
             self.collision_history.clear()
 
-            self.episode_start_time = time.time()
+            print("Environment reset successful. Starting new episode.")
             return [self.image_obs, self.navigation_obs]
 
         except:
+            print("An error occurred during environment reset. Attempting to clean up and reset again.")
             self.client.apply_batch([carla.command.DestroyActor(x) for x in self.sensor_list])
             self.client.apply_batch([carla.command.DestroyActor(x) for x in self.actor_list])
             self.client.apply_batch([carla.command.DestroyActor(x) for x in self.walker_list])
             self.sensor_list.clear()
-            self.actor_list.clear()
+            self.actor_list.clear()           
+            self.sensor_objects.clear()
             self.remove_sensors()
             if self.display_on:
                 pygame.quit()
@@ -218,6 +320,35 @@ class CarlaEnvironment():
                 else:
                     break
 
+            if self.pedestrian is not None and self.pedestrian.is_alive:
+
+                # Delay start so car begins moving first
+                if time.time() - self.episode_start_time < self.pedestrian_delay:
+                    pass
+
+                ped_loc = self.pedestrian.get_location()
+
+                direction = self.ped_end - ped_loc
+                distance = np.linalg.norm([direction.x, direction.y])
+
+                if distance > 0.5:
+                    direction_x = direction.x / distance
+                    direction_y = direction.y / distance
+
+                    control = carla.WalkerControl(
+                        direction=carla.Vector3D(direction_x, direction_y, 0.0),
+                        speed=1.2
+                    )
+
+                    self.pedestrian.apply_control(control)
+                else:
+                    self.pedestrian.apply_control(
+                        carla.WalkerControl(
+                            direction=carla.Vector3D(0.0, 0.0, 0.0),
+                            speed=0.0
+                        )
+                    )
+
             self.current_waypoint_index = waypoint_index
             # Calculate deviation from center of the lane
             self.current_waypoint = self.route_waypoints[ self.current_waypoint_index    % len(self.route_waypoints)]
@@ -242,7 +373,14 @@ class CarlaEnvironment():
 
             if len(self.collision_history) != 0:
                 done = True
-                reward = -10
+
+                last_collision = self.collision_history[-1]
+                other_type = last_collision["actor_type"]
+
+                if "walker" in other_type:
+                    reward = -200
+                else:
+                    reward = -10
             elif self.distance_from_center > self.max_distance_from_center:
                 done = True
                 reward = -10
@@ -292,28 +430,51 @@ class CarlaEnvironment():
             
             # Remove everything that has been spawned in the env
             if done:
+                self.episode_count += 1
+
+                collision = len(self.collision_history) > 0
+                pedestrian_collision = False
+
+                if collision:
+                    last_collision = self.collision_history[-1]
+                    if "walker" in last_collision["actor_type"]:
+                        pedestrian_collision = True
+
                 self.center_lane_deviation = self.center_lane_deviation / self.timesteps
                 self.distance_covered = abs(self.current_waypoint_index - self.checkpoint_waypoint_index)
-                
-                for sensor in self.sensor_list:
-                    sensor.destroy()
-                
-                self.remove_sensors()
-                
-                for actor in self.actor_list:
-                    actor.destroy()
-            
+
+                with open("training_results.csv", "a") as f:
+                    f.write(
+                        f"{self.episode_count},{self.timesteps},{reward:.2f},{self.distance_covered:.2f},{collision},{pedestrian_collision}\n"
+                    )  
+
             return [self.image_obs, self.navigation_obs], reward, done, [self.distance_covered, self.center_lane_deviation]
 
-        except:
-            self.client.apply_batch([carla.command.DestroyActor(x) for x in self.sensor_list])
-            self.client.apply_batch([carla.command.DestroyActor(x) for x in self.actor_list])
-            self.client.apply_batch([carla.command.DestroyActor(x) for x in self.walker_list])
+        except Exception as e:
+            print("STEP ERROR:", e)
+            traceback.print_exc()
+
+            self.client.apply_batch([carla.command.DestroyActor(x) for x in self.sensor_list if x is not None])
+            self.client.apply_batch([carla.command.DestroyActor(x) for x in self.actor_list if x is not None])
+            self.client.apply_batch([carla.command.DestroyActor(x) for x in self.walker_list if x is not None])
+            
             self.sensor_list.clear()
             self.actor_list.clear()
+            self.walker_list.clear()
+            self.sensor_objects.clear()
             self.remove_sensors()
-            if self.display_on:
-                pygame.quit()
+
+            return None, 0, True, [0, 0]
+        # except:
+        #     print("An error occurred during the step function. Resetting the environment.")
+        #     self.client.apply_batch([carla.command.DestroyActor(x) for x in self.sensor_list])
+        #     self.client.apply_batch([carla.command.DestroyActor(x) for x in self.actor_list])
+        #     self.client.apply_batch([carla.command.DestroyActor(x) for x in self.walker_list])
+        #     self.sensor_list.clear()
+        #     self.actor_list.clear()
+        #     self.remove_sensors()
+        #     if self.display_on:
+        #         pygame.quit()
 
 
 

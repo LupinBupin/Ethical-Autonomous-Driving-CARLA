@@ -120,7 +120,13 @@ class CollisionSensor:
         self = weak_self()
         if not self:
             return
+
         impulse = event.normal_impulse
-        intensity = math.sqrt(impulse.x ** 2 + impulse.y ** 2 + impulse.z ** 2)
-        self.collision_data.append(intensity)
+        intensity = (impulse.x**2 + impulse.y**2 + impulse.z**2) ** 0.5
+
+        self.collision_data.append({
+            "event": event,
+            "intensity": intensity,
+            "actor_type": event.other_actor.type_id if event.other_actor else "unknown"
+        })
 

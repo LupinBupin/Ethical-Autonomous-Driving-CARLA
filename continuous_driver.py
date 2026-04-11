@@ -33,6 +33,7 @@ def parse_args():
     parser.add_argument('--load-checkpoint', type=bool, default=MODEL_LOAD, help='resume training?')
     parser.add_argument('--torch-deterministic', type=lambda x:bool(strtobool(x)), default=True, nargs='?', const=True, help='if toggled, `torch.backends.cudnn.deterministic=False`')
     parser.add_argument('--cuda', type=lambda x:bool(strtobool(x)), default=True, nargs='?', const=True, help='if toggled, cuda will not be enabled by deafult')
+    parser.add_argument("--scenario", type=str, default="Scenario01", help="which scenario to run on")
     args = parser.parse_args()
     
     return args
@@ -110,9 +111,9 @@ def runner():
         logging.error("Connection has been refused by the server.")
         ConnectionRefusedError
     if train:
-        env = CarlaEnvironment(client, world,town)
+        env = CarlaEnvironment(client, world,town, checkpoint_frequency=100, continuous_action=True, scenario=args.scenario)
     else:
-        env = CarlaEnvironment(client, world,town, checkpoint_frequency=None)
+        env = CarlaEnvironment(client, world,town, checkpoint_frequency=None, continuous_action=True, scenario=args.scenario)
     encode = EncodeState(LATENT_DIM)
 
 
@@ -143,6 +144,7 @@ def runner():
                 agent = PPOAgent(town, action_std_init)
         if train:
             #Training
+            info = [0,0]
             while timestep < total_timesteps:
             
                 observation = env.reset()
@@ -158,6 +160,8 @@ def runner():
 
                     observation, reward, done, info = env.step(action)
                     if observation is None:
+                        done = True
+                        episode_finished = True
                         break
                     observation = encode.process(observation)
                     
@@ -170,18 +174,19 @@ def runner():
                     if timestep % action_std_decay_freq == 0:
                         action_std_init =  agent.decay_action_std(action_std_decay_rate, min_action_std)
 
-                    if timestep == total_timesteps -1:
+                    if timestep >= total_timesteps -1:
                         agent.chkpt_save()
 
                     # break; if the episode is over
                     if done:
-                        episode += 1
+                        episode_finished = True
 
                         t2 = datetime.now()
                         t3 = t2-t1
                         
                         episodic_length.append(abs(t3.total_seconds()))
                         break
+                    episode += 1
                 
                 deviation_from_center += info[1]
                 distance_covered += info[0]
@@ -198,6 +203,7 @@ def runner():
                 if episode % 10 == 0:
                     agent.learn()
                     agent.chkpt_save()
+                    agent.memory.clear()
                     chkt_file_nums = len(next(os.walk(f'checkpoints/PPO/{town}'))[2])
                     if chkt_file_nums != 0:
                         chkt_file_nums -=1
@@ -212,8 +218,8 @@ def runner():
                     writer.add_scalar("Episodic Reward/episode", scores[-1], episode)
                     writer.add_scalar("Cumulative Reward/info", cumulative_score, episode)
                     writer.add_scalar("Cumulative Reward/(t)", cumulative_score, timestep)
-                    writer.add_scalar("Average Episodic Reward/info", np.mean(scores[-5]), episode)
-                    writer.add_scalar("Average Reward/(t)", np.mean(scores[-5]), timestep)
+                    writer.add_scalar("Average Episodic Reward/info", np.mean(scores[-5:]), episode)
+                    writer.add_scalar("Average Reward/(t)", np.mean(scores[-5:]), timestep)
                     writer.add_scalar("Episode Length (s)/info", np.mean(episodic_length), episode)
                     writer.add_scalar("Reward/(t)", current_ep_reward, timestep)
                     writer.add_scalar("Average Deviation from Center/episode", deviation_from_center/5, episode)
@@ -235,20 +241,24 @@ def runner():
                         pickle.dump(data_obj, handle)
                         
             print("Terminating the run.")
-            sys.exit()
         else:
             #Testing
-            while timestep < args.test_timesteps:
+            num_test_episodes = 20
+
+            for episode in range(num_test_episodes):
                 observation = env.reset()
                 observation = encode.process(observation)
 
                 current_ep_reward = 0
                 t1 = datetime.now()
+
                 for t in range(args.episode_length):
                     # select action with policy
                     action = agent.get_action(observation, train=False)
                     observation, reward, done, info = env.step(action)
+
                     if observation is None:
+                        print("Terminating the run.")
                         break
                     observation = encode.process(observation)
                     
@@ -256,13 +266,15 @@ def runner():
                     current_ep_reward += reward
                     # break; if the episode is over
                     if done:
-                        episode += 1
-
-                        t2 = datetime.now()
-                        t3 = t2-t1
-                        
-                        episodic_length.append(abs(t3.total_seconds()))
+                        print("Episode completed.")
                         break
+
+                episode += 1
+                t2 = datetime.now()
+                t3 = t2-t1
+                        
+                episodic_length.append(abs(t3.total_seconds()))
+                        
                 deviation_from_center += info[1]
                 distance_covered += info[0]
                 
