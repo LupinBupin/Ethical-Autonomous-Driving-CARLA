@@ -27,6 +27,9 @@ class EncodeState():
         image_obs = image_obs.permute(0,3,2,1)
         image_obs = self.conv_encoder(image_obs)
         navigation_obs = torch.tensor(observation[1], dtype=torch.float).to(self.device)
+        image_obs = torch.nan_to_num(image_obs, nan=0.0, posinf=1e6, neginf=-1e6)
+        navigation_obs = torch.nan_to_num(navigation_obs, nan=0.0, posinf=1e6, neginf=-1e6)
         observation = torch.cat((image_obs.view(-1), navigation_obs), -1)
+        observation = torch.nan_to_num(observation, nan=0.0, posinf=1e6, neginf=-1e6)
         
         return observation

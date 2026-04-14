@@ -1,3 +1,4 @@
+import os
 import time
 import random
 import numpy as np
@@ -43,9 +44,10 @@ class CarlaEnvironment():
         self.actor_list = list()
         self.walker_list = list()
 
-        # Create CSV file with header (only once)
-        with open("training_results.csv", "w") as f:
-            f.write("episode,timesteps,reward,distance,collision,pedestrian_collision\n")
+        # Create CSV file with header only if it does not exist yet.
+        if not os.path.exists("training_results.csv"):
+            with open("training_results.csv", "w") as f:
+                f.write("episode,timesteps,reward,distance,collision,pedestrian_collision\n")
 
 
 
@@ -57,23 +59,9 @@ class CarlaEnvironment():
             self.ped_start = None
             self.ped_end = None
 
-            # Destroy sensors first
-            self.client.apply_batch([
-                carla.command.DestroyActor(x) for x in self.sensor_list if x is not None
-            ])
-            self.sensor_list.clear()
+            self.cleanup_actors()
 
-            # Destroy vehicles / actors
-            self.client.apply_batch([
-                carla.command.DestroyActor(x) for x in self.actor_list if x is not None
-            ])
-            self.actor_list.clear()
-
-            # Destroy walkers (IMPORTANT)
-            self.client.apply_batch([
-                carla.command.DestroyActor(x) for x in self.walker_list if x is not None
-            ])
-            self.walker_list.clear()
+            time.sleep(0.5)  # Ensure all actors are destroyed before proceeding
 
             self.sensor_objects.clear()
 
@@ -206,6 +194,7 @@ class CarlaEnvironment():
             self.angle = float(0.0)
             self.center_lane_deviation = 0.0
             self.distance_covered = 0.0
+            self.stopped_timesteps = 0
 
 
             if self.fresh_start:
@@ -248,11 +237,7 @@ class CarlaEnvironment():
 
         except:
             print("An error occurred during environment reset. Attempting to clean up and reset again.")
-            self.client.apply_batch([carla.command.DestroyActor(x) for x in self.sensor_list])
-            self.client.apply_batch([carla.command.DestroyActor(x) for x in self.actor_list])
-            self.client.apply_batch([carla.command.DestroyActor(x) for x in self.walker_list])
-            self.sensor_list.clear()
-            self.actor_list.clear()           
+            self.cleanup_actors()
             self.sensor_objects.clear()
             self.remove_sensors()
             if self.display_on:
@@ -273,6 +258,10 @@ class CarlaEnvironment():
             # Velocity of the vehicle
             velocity = self.vehicle.get_velocity()
             self.velocity = np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2) * 3.6
+            if self.velocity < 1.0:
+                self.stopped_timesteps += 1
+            else:
+                self.stopped_timesteps = 0
             
             # Action fron action space for contolling the vehicle with a discrete action
             if self.continous_action_space:
@@ -320,6 +309,10 @@ class CarlaEnvironment():
                 else:
                     break
 
+            pedestrian_distance = None
+            pedestrian_hazard = False
+            pedestrian_cleared = False
+
             if self.pedestrian is not None and self.pedestrian.is_alive:
 
                 # Delay start so car begins moving first
@@ -327,9 +320,15 @@ class CarlaEnvironment():
                     pass
 
                 ped_loc = self.pedestrian.get_location()
+                pedestrian_distance = np.linalg.norm([
+                    self.location.x - ped_loc.x,
+                    self.location.y - ped_loc.y
+                ])
+                pedestrian_hazard = pedestrian_distance < 12.0
 
                 direction = self.ped_end - ped_loc
                 distance = np.linalg.norm([direction.x, direction.y])
+                pedestrian_cleared = ped_loc.y < self.ped_end.y + 0.5
 
                 if distance > 0.5:
                     direction_x = direction.x / distance
@@ -371,41 +370,94 @@ class CarlaEnvironment():
             done = False
             reward = 0
 
+            # print("velocity:", self.velocity)
+            # print("distance_from_center:", self.distance_from_center)
+            # print("collision len:", len(self.collision_history))
+            # print("timesteps:", self.timesteps)
+
+            if self.velocity < 5.0 and not pedestrian_hazard:
+                reward += -2
+
             if len(self.collision_history) != 0:
+                print("Done Collision!")
                 done = True
 
                 last_collision = self.collision_history[-1]
                 other_type = last_collision["actor_type"]
 
                 if "walker" in other_type:
-                    reward = -200
+                    reward = -1000
                 else:
-                    reward = -10
+                    reward = -150
             elif self.distance_from_center > self.max_distance_from_center:
+                print("Done Deviation!")
                 done = True
-                reward = -10
+                reward = -25
             elif self.episode_start_time + 10 < time.time() and self.velocity < 1.0:
-                reward = -10
+                print("Done Stuck!")
+                reward = -25
                 done = True
             elif self.velocity > self.max_speed:
-                reward = -10
+                print("Done Speeding!")
+
+                reward = -25
                 done = True
+
+            if pedestrian_hazard:
+                if pedestrian_distance < 6.0 and self.velocity > 8.0:
+                    reward -= 8
+                elif pedestrian_distance < 10.0 and self.velocity > 12.0:
+                    reward -= 4
+
+                if pedestrian_distance < 8.0 and self.velocity < 2.0 and not pedestrian_cleared:
+                    reward += 1.5
+                elif pedestrian_distance < 12.0 and self.velocity < 5.0 and not pedestrian_cleared:
+                    reward += 0.5
+
+                if pedestrian_cleared and self.velocity < 6.0:
+                    reward -= 2
+
+            if self.stopped_timesteps > 40:
+                reward -= min(8.0, 0.2 * (self.stopped_timesteps - 40))
+
+            progress_scale = 0.002 if pedestrian_hazard else 0.01
+            progress_reward = self.current_waypoint_index * progress_scale
+            reward += progress_reward                     
 
             # Interpolated from 1 when centered to 0 when 3 m from center
             centering_factor = max(1.0 - self.distance_from_center / self.max_distance_from_center, 0.0)
             # Interpolated from 1 when aligned with the road to 0 when +/- 30 degress of road
             angle_factor = max(1.0 - abs(self.angle / np.deg2rad(20)), 0.0)
 
+            if self.distance_from_center > 1.0:
+                lane_drift_penalty = (self.distance_from_center - 1.0) * 3.0
+                if pedestrian_hazard:
+                    lane_drift_penalty *= 2.0
+                reward -= lane_drift_penalty
+
+            if self.distance_from_center > 2.0:
+                offroad_penalty = (self.distance_from_center - 2.0) * 8.0
+                if pedestrian_hazard:
+                    offroad_penalty *= 2.0
+                reward -= offroad_penalty
+
             if not done:
                 if self.continous_action_space:
-                    if self.velocity < self.min_speed:
-                        reward = (self.velocity / self.min_speed) * centering_factor * angle_factor    
-                    elif self.velocity > self.target_speed:               
-                        reward = (1.0 - (self.velocity-self.target_speed) / (self.max_speed-self.target_speed)) * centering_factor * angle_factor  
-                    else:                                         
-                        reward = 1.0 * centering_factor * angle_factor 
+                    if pedestrian_hazard:
+                        if self.velocity < 2.0:
+                            reward += 0.5 * centering_factor * angle_factor
+                        elif self.velocity < 6.0:
+                            reward += 1.0 * centering_factor * angle_factor
+                        else:
+                            reward -= 2.0 * centering_factor * angle_factor
+                    elif self.velocity < self.min_speed:
+                        reward += 0.5 * (self.velocity / self.min_speed) * centering_factor * angle_factor
+                    elif self.velocity > self.target_speed:
+                        reward += (1.0 - (self.velocity-self.target_speed) / (self.max_speed-self.target_speed)) * centering_factor * angle_factor
+                    else:
+                        reward += 1.0 * centering_factor * angle_factor
                 else:
-                    reward = 1.0 * centering_factor * angle_factor
+                    reward += 1.0 * centering_factor * angle_factor
 
             if self.timesteps >= 7500:
                 done = True
@@ -454,13 +506,7 @@ class CarlaEnvironment():
             print("STEP ERROR:", e)
             traceback.print_exc()
 
-            self.client.apply_batch([carla.command.DestroyActor(x) for x in self.sensor_list if x is not None])
-            self.client.apply_batch([carla.command.DestroyActor(x) for x in self.actor_list if x is not None])
-            self.client.apply_batch([carla.command.DestroyActor(x) for x in self.walker_list if x is not None])
-            
-            self.sensor_list.clear()
-            self.actor_list.clear()
-            self.walker_list.clear()
+            self.cleanup_actors()
             self.sensor_objects.clear()
             self.remove_sensors()
 
@@ -632,6 +678,41 @@ class CarlaEnvironment():
         # Main vehicle spawned into the env
         spawn_point = random.choice(spawn_points) if spawn_points else carla.Transform()
         self.vehicle = self.world.try_spawn_actor(vehicle_bp, spawn_point)
+
+
+    def cleanup_actors(self):
+        sensor_wrappers = [self.camera_obj, self.env_camera_obj, self.collision_obj]
+        for sensor_obj in sensor_wrappers:
+            if sensor_obj is not None and hasattr(sensor_obj, "sensor") and sensor_obj.sensor is not None:
+                try:
+                    sensor_obj.sensor.stop()
+                except:
+                    pass
+
+        for sensor_obj in sensor_wrappers:
+            if sensor_obj is not None and hasattr(sensor_obj, "sensor") and sensor_obj.sensor is not None:
+                try:
+                    sensor_obj.sensor.destroy()
+                except:
+                    pass
+
+        if self.sensor_list:
+            self.client.apply_batch_sync([
+                carla.command.DestroyActor(x) for x in self.sensor_list if x is not None
+            ], True)
+        self.sensor_list.clear()
+
+        if self.actor_list:
+            self.client.apply_batch_sync([
+                carla.command.DestroyActor(x) for x in self.actor_list if x is not None
+            ], True)
+        self.actor_list.clear()
+
+        if self.walker_list:
+            self.client.apply_batch_sync([
+                carla.command.DestroyActor(x) for x in self.walker_list if x is not None
+            ], True)
+        self.walker_list.clear()
 
 
     # Clean up method

@@ -16,6 +16,9 @@ from simulation.connection import ClientConnection
 from simulation.environment import CarlaEnvironment
 from parameters import *
 
+import faulthandler
+faulthandler.enable()
+
 
 def parse_args():
     
@@ -89,9 +92,11 @@ def runner():
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     
-    action_std_decay_rate = 0.05
-    min_action_std = 0.05   
-    action_std_decay_freq = 5e5
+    action_std_decay_rate = ACTION_STD_DECAY_RATE
+    min_action_std = MIN_ACTION_STD
+    action_std_decay_freq = ACTION_STD_DECAY_FREQ
+    update_episodes = PPO_UPDATE_EPISODES
+    save_freq = PPO_SAVE_FREQ
     timestep = 0
     episode = 0
     cumulative_score = 0
@@ -179,6 +184,7 @@ def runner():
 
                     # break; if the episode is over
                     if done:
+                        episode += 1
                         episode_finished = True
 
                         t2 = datetime.now()
@@ -186,7 +192,6 @@ def runner():
                         
                         episodic_length.append(abs(t3.total_seconds()))
                         break
-                    episode += 1
                 
                 deviation_from_center += info[1]
                 distance_covered += info[0]
@@ -198,12 +203,12 @@ def runner():
                 else:
                     cumulative_score = np.mean(scores)
 
-
+                print(f"Episode {episode} | timestep={timestep} / {total_timesteps}")
                 print('Episode: {}'.format(episode),', Timestep: {}'.format(timestep),', Reward:  {:.2f}'.format(current_ep_reward),', Average Reward:  {:.2f}'.format(cumulative_score))
-                if episode % 10 == 0:
+                if episode % update_episodes == 0:
                     agent.learn()
                     agent.chkpt_save()
-                    agent.memory.clear()
+
                     chkt_file_nums = len(next(os.walk(f'checkpoints/PPO/{town}'))[2])
                     if chkt_file_nums != 0:
                         chkt_file_nums -=1
@@ -213,25 +218,25 @@ def runner():
                         pickle.dump(data_obj, handle)
                     
                 
-                if episode % 5 == 0:
+                if episode % update_episodes == 0:
 
                     writer.add_scalar("Episodic Reward/episode", scores[-1], episode)
                     writer.add_scalar("Cumulative Reward/info", cumulative_score, episode)
                     writer.add_scalar("Cumulative Reward/(t)", cumulative_score, timestep)
-                    writer.add_scalar("Average Episodic Reward/info", np.mean(scores[-5:]), episode)
-                    writer.add_scalar("Average Reward/(t)", np.mean(scores[-5:]), timestep)
+                    writer.add_scalar("Average Episodic Reward/info", np.mean(scores[-update_episodes:]), episode)
+                    writer.add_scalar("Average Reward/(t)", np.mean(scores[-update_episodes:]), timestep)
                     writer.add_scalar("Episode Length (s)/info", np.mean(episodic_length), episode)
                     writer.add_scalar("Reward/(t)", current_ep_reward, timestep)
-                    writer.add_scalar("Average Deviation from Center/episode", deviation_from_center/5, episode)
-                    writer.add_scalar("Average Deviation from Center/(t)", deviation_from_center/5, timestep)
-                    writer.add_scalar("Average Distance Covered (m)/episode", distance_covered/5, episode)
-                    writer.add_scalar("Average Distance Covered (m)/(t)", distance_covered/5, timestep)
+                    writer.add_scalar("Average Deviation from Center/episode", deviation_from_center/update_episodes, episode)
+                    writer.add_scalar("Average Deviation from Center/(t)", deviation_from_center/update_episodes, timestep)
+                    writer.add_scalar("Average Distance Covered (m)/episode", distance_covered/update_episodes, episode)
+                    writer.add_scalar("Average Distance Covered (m)/(t)", distance_covered/update_episodes, timestep)
 
                     episodic_length = list()
                     deviation_from_center = 0
                     distance_covered = 0
 
-                if episode % 100 == 0:
+                if episode % save_freq == 0:
                     
                     agent.save()
                     chkt_file_nums = len(next(os.walk(f'checkpoints/PPO/{town}'))[2])
@@ -261,13 +266,15 @@ def runner():
                         print("Terminating the run.")
                         break
                     observation = encode.process(observation)
-                    
+
                     timestep +=1
                     current_ep_reward += reward
                     # break; if the episode is over
                     if done:
                         print("Episode completed.")
                         break
+
+                    t += 1
 
                 episode += 1
                 t2 = datetime.now()
@@ -298,7 +305,6 @@ def runner():
                 distance_covered = 0
 
             print("Terminating the run.")
-            sys.exit()
 
     finally:
         sys.exit()

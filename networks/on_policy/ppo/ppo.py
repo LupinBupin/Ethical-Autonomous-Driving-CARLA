@@ -18,9 +18,6 @@ class ActorCritic(nn.Module):
         # Note that I chose 0.2 for stdev arbitrarily.
         self.cov_var = torch.full((self.action_dim,), action_std_init)
 
-        # Create the covariance matrix
-        self.cov_mat = torch.diag(self.cov_var).unsqueeze(dim=0)
-
         # actor
         self.actor = nn.Sequential(
                         nn.Linear(self.obs_dim, 500),
@@ -62,10 +59,15 @@ class ActorCritic(nn.Module):
         
         if isinstance(obs, np.ndarray):
             obs = torch.tensor(obs, dtype=torch.float)
+
         mean = self.actor(obs)
-        # Create our Multivariate Normal Distribution
-        dist = MultivariateNormal(mean, self.cov_mat)
-        # Sample an action from the distribution and get its log prob
+
+        if torch.isnan(mean).any() or torch.isinf(mean).any():
+            raise ValueError(f"Actor produced invalid mean: {mean}")
+
+        cov_var = self.cov_var.to(mean.device)
+        cov_mat = torch.diag(cov_var)
+        dist = MultivariateNormal(mean, cov_mat)
         action = dist.sample()
         log_prob = dist.log_prob(action)
         
