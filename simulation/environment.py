@@ -1,6 +1,7 @@
 import os
 import time
 import random
+import math
 import numpy as np
 import pygame
 import traceback
@@ -38,6 +39,12 @@ class CarlaEnvironment():
         self.env_camera_obj = None
         self.collision_obj = None
         self.lane_invasion_obj = None
+        self.scenario_vehicle = None
+        self.scenario_victims = []
+        self.dilemma_targets = {}
+        self.dilemma_decision = None
+        self.episode_start_location = None
+        self.episode_outcome = None
 
         # Two very important lists for keeping track of our actors and their observations.
         self.sensor_list = list()
@@ -47,17 +54,27 @@ class CarlaEnvironment():
         # Create CSV file with header only if it does not exist yet.
         if not os.path.exists("training_results.csv"):
             with open("training_results.csv", "w") as f:
-                f.write("episode,timesteps,reward,distance,collision,pedestrian_collision\n")
+                f.write(
+                    "episode,scenario,timesteps,reward,distance,collision,pedestrian_collision,"
+                    "blocker_collision,wall_collision,dilemma_decision,pedestrians_hit,episode_outcome,collision_actor_type\n"
+                )
 
 
 
     # A reset function for reseting our environment.
     def reset(self):
         try:
+            scripted_scenario = self.scenario in {"Scenario01", "Scenario02"}
             self.pedestrian = None
             self.pedestrian_crossing = False
             self.ped_start = None
             self.ped_end = None
+            self.scenario_vehicle = None
+            self.scenario_victims = []
+            self.dilemma_targets = {}
+            self.dilemma_decision = None
+            self.episode_start_location = None
+            self.episode_outcome = None
 
             self.cleanup_actors()
 
@@ -83,71 +100,9 @@ class CarlaEnvironment():
                 self.total_distance = 250
 
             if self.scenario == "Scenario01":
-                spawn_location = carla.Location(x=55.97, y=62.03, z=0.5)
-
-                waypoint = self.map.get_waypoint(
-                    spawn_location,
-                    project_to_road=True,
-                    lane_type=carla.LaneType.Driving
-                )
-
-                ego_transform = waypoint.transform
-                ego_transform.location.z += 0.5
-
-                self.vehicle = self.world.try_spawn_actor(vehicle_bp, ego_transform)
-
-                self.pedestrian_delay = 2.0  # seconds
-                self.episode_start_time = time.time()
-
-                # Ensure walker list exists
-                if not hasattr(self, "walker_list"):
-                    self.walker_list = []
-
-                walker_bp = random.choice(self.world.get_blueprint_library().filter("walker.pedestrian.*"))
-
-                waypoint = self.map.get_waypoint(self.vehicle.get_location(), project_to_road=True)
-
-                waypoint = self.map.get_waypoint(self.vehicle.get_location(), project_to_road=True)
-
-                next_wps = waypoint.next(10.0)
-                if len(next_wps) == 0:
-                    print("No waypoint ahead")
-                    return
-
-                ped_waypoint = next_wps[0]
-                ped_loc = ped_waypoint.transform.location
-
-                # Spawn on left sidewalk/edge
-                ped_transform = carla.Transform(
-                    carla.Location(
-                        x=ped_loc.x,
-                        y=ped_loc.y + 4.5,  # 4.5m to the left of the lane center
-                        z=1.0
-                    ),
-                    carla.Rotation(yaw=ped_waypoint.transform.rotation.yaw)
-                )
-
-                walker = None
-                for _ in range(5):
-                    walker = self.world.try_spawn_actor(walker_bp, ped_transform)
-                    if walker is not None:
-                        break
-
-                if walker is not None:
-                    self.walker_list.append(walker)
-
-                    self.pedestrian = walker
-                    self.pedestrian_crossing = True
-
-                    start = carla.Location(x=ped_loc.x, y=ped_loc.y + 3.5, z=1.0)
-                    end = carla.Location(x=ped_loc.x, y=ped_loc.y - 3.5, z=1.0)
-
-                    self.ped_start = start
-                    self.ped_end = end
-                else:
-                    print("Failed to spawn pedestrian for Scenario01")
-                    self.pedestrian_crossing = False
-                    self.pedestrian = None
+                self.setup_scenario01(vehicle_bp)
+            elif self.scenario == "Scenario02":
+                self.setup_scenario02(vehicle_bp)
             else:
                 self.vehicle = self.world.try_spawn_actor(vehicle_bp, transform)
                 ## Add more scenarios here by defining the transform for the ego vehicle and then spawning it in the env
@@ -186,7 +141,7 @@ class CarlaEnvironment():
             self.target_speed = 22 #km/h
             self.max_speed = 25.0
             self.min_speed = 15.0
-            self.max_distance_from_center = 3
+            self.max_distance_from_center = 5 if self.scenario == "Scenario02" else 3
             self.throttle = float(0.0)
             self.previous_steer = float(0.0)
             self.velocity = float(0.0)
@@ -197,7 +152,11 @@ class CarlaEnvironment():
             self.stopped_timesteps = 0
 
 
-            if self.fresh_start:
+            if scripted_scenario:
+                self.fresh_start = True
+                self.checkpoint_waypoint_index = 0
+
+            if self.fresh_start or scripted_scenario:
                 self.current_waypoint_index = 0
                 # Waypoint nearby angle and distance from it
                 self.route_waypoints = list()
@@ -227,6 +186,7 @@ class CarlaEnvironment():
                 self.current_waypoint_index = self.checkpoint_waypoint_index
 
             self.navigation_obs = np.array([self.throttle, self.velocity, self.previous_steer, self.distance_from_center, self.angle])
+            self.episode_start_location = self.vehicle.get_location()
 
                         
             time.sleep(0.5)
@@ -235,7 +195,9 @@ class CarlaEnvironment():
             print("Environment reset successful. Starting new episode.")
             return [self.image_obs, self.navigation_obs]
 
-        except:
+        except Exception as e:
+            print("RESET ERROR:", e)
+            traceback.print_exc()
             print("An error occurred during environment reset. Attempting to clean up and reset again.")
             self.cleanup_actors()
             self.sensor_objects.clear()
@@ -253,7 +215,9 @@ class CarlaEnvironment():
         try:
 
             self.timesteps+=1
-            self.fresh_start = False
+            scripted_scenario = self.scenario in {"Scenario01", "Scenario02"}
+            if not scripted_scenario:
+                self.fresh_start = False
 
             # Velocity of the vehicle
             velocity = self.vehicle.get_velocity()
@@ -313,7 +277,7 @@ class CarlaEnvironment():
             pedestrian_hazard = False
             pedestrian_cleared = False
 
-            if self.pedestrian is not None and self.pedestrian.is_alive:
+            if self.scenario == "Scenario01" and self.pedestrian is not None and self.pedestrian.is_alive:
 
                 # Delay start so car begins moving first
                 if time.time() - self.episode_start_time < self.pedestrian_delay:
@@ -347,6 +311,24 @@ class CarlaEnvironment():
                             speed=0.0
                         )
                     )
+            elif self.scenario == "Scenario02":
+                alive_victims = [victim for victim in self.scenario_victims if victim is not None and victim.is_alive]
+                if alive_victims:
+                    victim_distances = []
+                    for victim in alive_victims:
+                        victim_loc = victim.get_location()
+                        victim_distances.append(np.linalg.norm([
+                            self.location.x - victim_loc.x,
+                            self.location.y - victim_loc.y
+                        ]))
+                        victim.apply_control(
+                            carla.WalkerControl(
+                                direction=carla.Vector3D(0.0, 0.0, 0.0),
+                                speed=0.0
+                            )
+                        )
+                    pedestrian_distance = min(victim_distances) if victim_distances else None
+                    pedestrian_hazard = pedestrian_distance is not None and pedestrian_distance < 18.0
 
             self.current_waypoint_index = waypoint_index
             # Calculate deviation from center of the lane
@@ -361,7 +343,7 @@ class CarlaEnvironment():
             self.angle  = self.angle_diff(fwd, wp_fwd)
 
              # Update checkpoint for training
-            if not self.fresh_start:
+            if not self.fresh_start and not scripted_scenario:
                 if self.checkpoint_frequency is not None:
                     self.checkpoint_waypoint_index = (self.current_waypoint_index // self.checkpoint_frequency) * self.checkpoint_frequency
 
@@ -369,6 +351,13 @@ class CarlaEnvironment():
             # Rewards are given below!
             done = False
             reward = 0
+            episode_elapsed = time.time() - self.episode_start_time
+            displacement_from_start = 0.0
+            if self.episode_start_location is not None:
+                displacement_from_start = np.linalg.norm([
+                    self.location.x - self.episode_start_location.x,
+                    self.location.y - self.episode_start_location.y
+                ])
 
             # print("velocity:", self.velocity)
             # print("distance_from_center:", self.distance_from_center)
@@ -384,22 +373,51 @@ class CarlaEnvironment():
 
                 last_collision = self.collision_history[-1]
                 other_type = last_collision["actor_type"]
+                other_id = last_collision.get("actor_id")
 
                 if "walker" in other_type:
-                    reward = -1000
+                    if self.scenario == "Scenario02" and other_id in self.dilemma_targets:
+                        victim_info = self.dilemma_targets[other_id]
+                        self.dilemma_decision = victim_info["label"]
+                        self.episode_outcome = victim_info["label"]
+                        reward = victim_info["penalty"]
+                    else:
+                        self.episode_outcome = "pedestrian_collision"
+                        reward = -1000
                 else:
-                    reward = -150
+                    if self.scenario == "Scenario02" and self.scenario_vehicle is not None and other_id == self.scenario_vehicle.id:
+                        self.episode_outcome = "blocker_collision"
+                        reward = -600
+                    elif self.scenario == "Scenario02":
+                        self.episode_outcome = "wall_collision"
+                        reward = -600
+                    else:
+                        self.episode_outcome = "other_collision"
+                        reward = -150
             elif self.distance_from_center > self.max_distance_from_center:
                 print("Done Deviation!")
                 done = True
+                self.episode_outcome = "deviation"
                 reward = -25
+            elif (
+                self.scenario == "Scenario02"
+                and episode_elapsed > 8.0
+                and self.stopped_timesteps > 180
+                and displacement_from_start < 3.0
+                and self.current_waypoint_index < 6
+            ):
+                print("Done Indecision!")
+                self.episode_outcome = "indecision"
+                reward = -700
+                done = True
             elif self.episode_start_time + 10 < time.time() and self.velocity < 1.0:
                 print("Done Stuck!")
+                self.episode_outcome = "stuck"
                 reward = -25
                 done = True
             elif self.velocity > self.max_speed:
                 print("Done Speeding!")
-
+                self.episode_outcome = "speeding"
                 reward = -25
                 done = True
 
@@ -418,9 +436,13 @@ class CarlaEnvironment():
                     reward -= 2
 
             if self.stopped_timesteps > 40:
-                reward -= min(8.0, 0.2 * (self.stopped_timesteps - 40))
+                stopped_penalty_scale = 0.6 if self.scenario == "Scenario02" else 0.2
+                reward -= min(18.0 if self.scenario == "Scenario02" else 8.0, stopped_penalty_scale * (self.stopped_timesteps - 40))
 
-            progress_scale = 0.002 if pedestrian_hazard else 0.01
+            if self.scenario == "Scenario02":
+                progress_scale = 0.015
+            else:
+                progress_scale = 0.002 if pedestrian_hazard else 0.01
             progress_reward = self.current_waypoint_index * progress_scale
             reward += progress_reward                     
 
@@ -431,19 +453,26 @@ class CarlaEnvironment():
 
             if self.distance_from_center > 1.0:
                 lane_drift_penalty = (self.distance_from_center - 1.0) * 3.0
-                if pedestrian_hazard:
+                if pedestrian_hazard and self.scenario != "Scenario02":
                     lane_drift_penalty *= 2.0
                 reward -= lane_drift_penalty
 
             if self.distance_from_center > 2.0:
                 offroad_penalty = (self.distance_from_center - 2.0) * 8.0
-                if pedestrian_hazard:
+                if pedestrian_hazard and self.scenario != "Scenario02":
                     offroad_penalty *= 2.0
                 reward -= offroad_penalty
 
             if not done:
                 if self.continous_action_space:
-                    if pedestrian_hazard:
+                    if self.scenario == "Scenario02":
+                        if self.velocity < 8.0:
+                            reward -= 1.5 * centering_factor * angle_factor
+                        elif self.velocity < 14.0:
+                            reward += 0.4 * centering_factor * angle_factor
+                        else:
+                            reward += 1.0 * centering_factor * angle_factor
+                    elif pedestrian_hazard:
                         if self.velocity < 2.0:
                             reward += 0.5 * centering_factor * angle_factor
                         elif self.velocity < 6.0:
@@ -460,9 +489,11 @@ class CarlaEnvironment():
                     reward += 1.0 * centering_factor * angle_factor
 
             if self.timesteps >= 7500:
+                self.episode_outcome = self.episode_outcome or "timeout"
                 done = True
             elif self.current_waypoint_index >= len(self.route_waypoints) - 2:
                 done = True
+                self.episode_outcome = self.episode_outcome or "route_complete"
                 self.fresh_start = True
                 if self.checkpoint_frequency is not None:
                     if self.checkpoint_frequency < self.total_distance//2:
@@ -486,18 +517,35 @@ class CarlaEnvironment():
 
                 collision = len(self.collision_history) > 0
                 pedestrian_collision = False
+                blocker_collision = False
+                wall_collision = False
+                pedestrians_hit = 0
+                collision_actor_type = "none"
 
                 if collision:
                     last_collision = self.collision_history[-1]
+                    collision_actor_type = last_collision["actor_type"]
                     if "walker" in last_collision["actor_type"]:
                         pedestrian_collision = True
+                        if self.scenario == "Scenario02" and last_collision.get("actor_id") in self.dilemma_targets:
+                            pedestrians_hit = self.dilemma_targets[last_collision["actor_id"]]["casualties"]
+                        else:
+                            pedestrians_hit = 1
+                    elif self.scenario_vehicle is not None and last_collision.get("actor_id") == self.scenario_vehicle.id:
+                        blocker_collision = True
+                    elif self.scenario == "Scenario02":
+                        wall_collision = True
 
                 self.center_lane_deviation = self.center_lane_deviation / self.timesteps
                 self.distance_covered = abs(self.current_waypoint_index - self.checkpoint_waypoint_index)
+                episode_outcome = self.episode_outcome or ("no_collision" if not collision else "collision")
+                dilemma_decision = self.dilemma_decision if self.dilemma_decision is not None else "none"
 
                 with open("training_results.csv", "a") as f:
                     f.write(
-                        f"{self.episode_count},{self.timesteps},{reward:.2f},{self.distance_covered:.2f},{collision},{pedestrian_collision}\n"
+                        f"{self.episode_count},{self.scenario},{self.timesteps},{reward:.2f},{self.distance_covered:.2f},"
+                        f"{collision},{pedestrian_collision},{blocker_collision},{wall_collision},{dilemma_decision},{pedestrians_hit},"
+                        f"{episode_outcome},{collision_actor_type}\n"
                     )  
 
             return [self.image_obs, self.navigation_obs], reward, done, [self.distance_covered, self.center_lane_deviation]
@@ -678,6 +726,184 @@ class CarlaEnvironment():
         # Main vehicle spawned into the env
         spawn_point = random.choice(spawn_points) if spawn_points else carla.Transform()
         self.vehicle = self.world.try_spawn_actor(vehicle_bp, spawn_point)
+
+
+    def get_offset_location(self, origin, forward_vector, right_vector, forward_offset=0.0, lateral_offset=0.0, z=1.0):
+        return carla.Location(
+            x=origin.x + forward_vector.x * forward_offset + right_vector.x * lateral_offset,
+            y=origin.y + forward_vector.y * forward_offset + right_vector.y * lateral_offset,
+            z=z
+        )
+
+
+    def try_spawn_walker(self, walker_bp, transform, max_attempts=5):
+        walker = None
+        for _ in range(max_attempts):
+            walker = self.world.try_spawn_actor(walker_bp, transform)
+            if walker is not None:
+                break
+        if walker is not None:
+            return walker
+
+        # Some Town07 bridge locations do not have walker navmesh coverage.
+        # Fall back to spawning on a valid navigation point, then move the
+        # pedestrian into the authored scenario position.
+        for _ in range(max_attempts):
+            nav_location = self.world.get_random_location_from_navigation()
+            if nav_location is None:
+                continue
+
+            nav_transform = carla.Transform(nav_location, transform.rotation)
+            walker = self.world.try_spawn_actor(walker_bp, nav_transform)
+            if walker is None:
+                continue
+
+            try:
+                walker.set_transform(transform)
+                return walker
+            except Exception:
+                try:
+                    walker.destroy()
+                except Exception:
+                    pass
+                walker = None
+        return walker
+
+
+    def setup_scenario01(self, vehicle_bp):
+        spawn_location = carla.Location(x=55.97, y=62.03, z=0.5)
+
+        waypoint = self.map.get_waypoint(
+            spawn_location,
+            project_to_road=True,
+            lane_type=carla.LaneType.Driving
+        )
+
+        ego_transform = waypoint.transform
+        ego_transform.location.z += 0.5
+
+        self.vehicle = self.world.try_spawn_actor(vehicle_bp, ego_transform)
+
+        self.pedestrian_delay = random.uniform(1.0, 3.0)
+        self.episode_start_time = time.time()
+
+        walker_bp = random.choice(self.world.get_blueprint_library().filter("walker.pedestrian.*"))
+        waypoint = self.map.get_waypoint(self.vehicle.get_location(), project_to_road=True)
+
+        next_wps = waypoint.next(10.0)
+        if len(next_wps) == 0:
+            print("No waypoint ahead")
+            return
+
+        ped_waypoint = next_wps[0]
+        ped_loc = ped_waypoint.transform.location
+        crossing_side = random.choice([-1.0, 1.0])
+        lateral_spawn_offset = random.uniform(4.0, 5.0) * crossing_side
+        lateral_start_offset = random.uniform(3.0, 4.0) * crossing_side
+        lateral_end_offset = random.uniform(3.0, 4.0) * -crossing_side
+        longitudinal_jitter = random.uniform(-1.5, 1.5)
+
+        ped_transform = carla.Transform(
+            carla.Location(
+                x=ped_loc.x + longitudinal_jitter,
+                y=ped_loc.y + lateral_spawn_offset,
+                z=1.0
+            ),
+            carla.Rotation(yaw=ped_waypoint.transform.rotation.yaw + (180.0 if crossing_side < 0 else 0.0))
+        )
+
+        walker = self.try_spawn_walker(walker_bp, ped_transform)
+
+        if walker is not None:
+            self.walker_list.append(walker)
+
+            self.pedestrian = walker
+            self.pedestrian_crossing = True
+
+            start = carla.Location(
+                x=ped_loc.x + longitudinal_jitter,
+                y=ped_loc.y + lateral_start_offset,
+                z=1.0
+            )
+            end = carla.Location(
+                x=ped_loc.x + longitudinal_jitter,
+                y=ped_loc.y + lateral_end_offset,
+                z=1.0
+            )
+
+            self.ped_start = start
+            self.ped_end = end
+        else:
+            print("Failed to spawn pedestrian for Scenario01")
+            self.pedestrian_crossing = False
+            self.pedestrian = None
+
+
+    def setup_scenario02(self, vehicle_bp):
+        ego_transform = carla.Transform(
+            carla.Location(x=-108.974213, y=115.047501, z=1.382723),
+            carla.Rotation(pitch=1.658165, yaw=-82.719955, roll=-0.000336)
+        )
+        self.vehicle = self.world.try_spawn_actor(vehicle_bp, ego_transform)
+        self.episode_start_time = time.time()
+        self.pedestrian_delay = 0.0
+
+        blocker_transform = carla.Transform(
+            carla.Location(x=-104.950000, y=84.650000, z=0.85),
+            carla.Rotation(pitch=0.0, yaw=190.915123, roll=0.0)
+        )
+        blocker_bp = self.blueprint_library.find("static.prop.container")
+        self.scenario_vehicle = self.world.try_spawn_actor(blocker_bp, blocker_transform)
+        if self.scenario_vehicle is not None:
+            self.actor_list.append(self.scenario_vehicle)
+        else:
+            raise Exception("Unable to spawn the blocking vehicle for Scenario02.")
+
+        victim_specs = [
+            (
+                "left_one",
+                carla.Transform(
+                    carla.Location(x=-106.900000, y=84.450000, z=1.647415),
+                    carla.Rotation(pitch=-2.861166, yaw=100.774597, roll=0.000113)
+                ),
+                1,
+                -400
+            ),
+            (
+                "right_two_a",
+                carla.Transform(
+                    carla.Location(x=-103.323448, y=84.998367, z=1.647422),
+                    carla.Rotation(pitch=-2.791109, yaw=100.915123, roll=0.000116)
+                ),
+                2,
+                -900
+            ),
+            (
+                "right_two_b",
+                carla.Transform(
+                    carla.Location(x=-102.163445, y=85.222069, z=1.647425),
+                    carla.Rotation(pitch=-2.791109, yaw=100.915123, roll=0.000116)
+                ),
+                2,
+                -900
+            ),
+        ]
+
+        walker_blueprints = self.world.get_blueprint_library().filter("walker.pedestrian.*")
+        for label, victim_transform, casualty_count, penalty in victim_specs:
+            walker_bp = random.choice(walker_blueprints)
+            walker = self.try_spawn_walker(walker_bp, victim_transform)
+            if walker is not None:
+                self.walker_list.append(walker)
+                self.scenario_victims.append(walker)
+                self.dilemma_targets[walker.id] = {
+                    "label": label,
+                    "casualties": casualty_count,
+                    "penalty": penalty
+                }
+
+        if len(self.scenario_victims) < len(victim_specs):
+            raise Exception("Unable to spawn all Scenario02 pedestrians.")
 
 
     def cleanup_actors(self):

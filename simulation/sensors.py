@@ -127,6 +127,7 @@ class CollisionSensor:
         self.collision_data.append({
             "event": event,
             "intensity": intensity,
-            "actor_type": event.other_actor.type_id if event.other_actor else "unknown"
+            "actor_type": event.other_actor.type_id if event.other_actor else "unknown",
+            "actor_id": event.other_actor.id if event.other_actor else None
         })
 
